@@ -4,6 +4,7 @@ import streamlit as st
 import time
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor
+import re
 
 # Set page configuration
 st.set_page_config(
@@ -81,26 +82,32 @@ def get_fund_data(ticker):
     
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.trackinsight.com/en/',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1',
         }
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
         
-        soup = BeautifulSoup(response.text, 'html.parser')
+        response = requests.get(url, headers=headers, timeout=10)
         
-        # Find the div containing fund data
-        fund_data_div = soup.find('div', class_='vTiuKeOU')
-        
-        if not fund_data_div:
+        if response.status_code != 200:
             return {
                 'ticker': ticker,
                 'status': 'error',
-                'message': 'Could not find fund data on page'
+                'message': f'HTTP error: {response.status_code}'
             }
         
-        # Extract the fund name
-        fund_name_element = soup.find('h1', class_='LuOMg9wG')
-        fund_name = fund_name_element.text if fund_name_element else ticker
+        # Save HTML content to debug
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # First, try to find the fund name
+        fund_name_element = soup.find('h1')
+        fund_name = fund_name_element.text.strip() if fund_name_element else ticker
         
         # Initialize data dictionary
         data = {
@@ -109,40 +116,97 @@ def get_fund_data(ticker):
             'status': 'success'
         }
         
-        # Extract data points
-        data_items = fund_data_div.find_all('div', class_='J15CnrXn')
-        for item in data_items:
-            label_div = item.find('div', class_='eYwhIfAy')
-            if not label_div:
-                continue
-                
-            label = label_div.get_text(strip=True).replace('.', '')
+        # Find all potential data containers
+        # Look for divs that contain labels like "Last price", "1M perf", etc.
+        
+        # Method 1: Find by text content
+        last_price = None
+        performance_1m = None
+        flows_1m = None
+        aum = None
+        expense_ratio = None
+        nav = None
+        nav_change_1d = None
+        
+        # Extract data by finding relevant text labels
+        for div in soup.find_all('div'):
+            text_content = div.get_text(strip=True)
             
-            # Handle different value classes
-            value_div = item.find('div', class_='tvV29egN') or item.find('div', class_='YRW3R1in')
-            if value_div:
-                value = value_div.get_text(strip=True)
-                
-                # Clean up labels for consistency
-                if "Last price" in label:
-                    data['last_price'] = value
-                elif "1M perf" in label:
-                    data['performance_1m'] = value
-                elif "1M flows" in label:
-                    data['flows_1m'] = value
-                elif "AuM" in label:
-                    data['aum'] = value
-                elif "E/R" in label:
-                    data['expense_ratio'] = value
-                
-                # Look for NAV and NAV change (these might be in different locations)
-                nav_div = soup.find('div', string='NAV')
-                if nav_div and nav_div.find_next():
-                    data['nav'] = nav_div.find_next().get_text(strip=True)
-                
-                nav_change_div = soup.find('div', string='NAV change')
-                if nav_change_div and nav_change_div.find_next():
-                    data['nav_change_1d'] = nav_change_div.find_next().get_text(strip=True)
+            # Last price
+            if text_content == "Last price":
+                next_div = div.find_next('div')
+                if next_div:
+                    last_price = next_div.get_text(strip=True)
+                    data['last_price'] = last_price
+            
+            # 1M performance
+            elif text_content == "1M perf." or text_content == "1M perf":
+                next_div = div.find_next('div')
+                if next_div:
+                    performance_1m = next_div.get_text(strip=True)
+                    data['performance_1m'] = performance_1m
+            
+            # 1M flows
+            elif text_content == "1M flows":
+                next_div = div.find_next('div')
+                if next_div:
+                    flows_1m = next_div.get_text(strip=True)
+                    data['flows_1m'] = flows_1m
+            
+            # AuM
+            elif text_content == "AuM":
+                next_div = div.find_next('div')
+                if next_div:
+                    aum = next_div.get_text(strip=True)
+                    data['aum'] = aum
+            
+            # Expense Ratio
+            elif text_content == "E/R":
+                next_div = div.find_next('div')
+                if next_div:
+                    expense_ratio = next_div.get_text(strip=True)
+                    data['expense_ratio'] = expense_ratio
+            
+            # NAV
+            elif text_content == "NAV":
+                next_div = div.find_next('div')
+                if next_div:
+                    nav = next_div.get_text(strip=True)
+                    data['nav'] = nav
+            
+            # NAV change
+            elif "NAV change" in text_content:
+                next_div = div.find_next('div')
+                if next_div:
+                    nav_change_1d = next_div.get_text(strip=True)
+                    data['nav_change_1d'] = nav_change_1d
+        
+        # Method 2: Try to find the data by pattern matching
+        if not last_price:
+            # Look for currency symbols followed by numbers
+            currency_pattern = re.compile(r'[\$€£¥]\s*[\d,]+\.?\d*')
+            for div in soup.find_all('div'):
+                text = div.get_text(strip=True)
+                if currency_pattern.match(text):
+                    data['last_price'] = text
+                    break
+        
+        # Alternative method: Try looking for specific CSS classes
+        # This is a fallback in case the site structure has completely changed
+        for div in soup.find_all('div', class_=lambda c: c and ('Price' in c or 'price' in c)):
+            parent_div = div.parent
+            if parent_div:
+                value_div = parent_div.find_next('div')
+                if value_div:
+                    data['last_price'] = value_div.get_text(strip=True)
+        
+        # If we couldn't find any data, mark as error
+        if len(data) <= 3:  # Only ticker, name, and status
+            return {
+                'ticker': ticker,
+                'status': 'error',
+                'message': 'Could not find fund data on page'
+            }
         
         return data
     
@@ -292,6 +356,15 @@ def main():
     # App title and description
     st.title("📊 Fund Data Tracker")
     st.markdown("Real-time data for selected funds from TrackInsight")
+    
+    # Add debugging options
+    with st.expander("Debug Options"):
+        debug_ticker = st.selectbox("Test single ticker", [""] + FUND_TICKERS)
+        if st.button("Test Fetch"):
+            if debug_ticker:
+                with st.spinner(f"Testing fetch for {debug_ticker}..."):
+                    result = get_fund_data(debug_ticker)
+                    st.json(result)
     
     # Add a refresh button and view toggle
     col1, col2 = st.columns([1, 4])
