@@ -1,14 +1,14 @@
-import requests
-from bs4 import BeautifulSoup
+import yfinance as yf
 import streamlit as st
-import time
 import pandas as pd
+import time
 from concurrent.futures import ThreadPoolExecutor
-import re
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
 
 # Set page configuration
 st.set_page_config(
-    page_title="Fund Tracker",
+    page_title="Fund Tracker - Yahoo Finance",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -34,6 +34,10 @@ st.markdown("""
     font-size: 20px;
     font-weight: bold;
     color: #333;
+}
+.fund-subtitle {
+    font-size: 14px;
+    color: #666;
 }
 .fund-data {
     display: grid;
@@ -69,146 +73,102 @@ st.markdown("""
 
 # List of fund tickers to track
 FUND_TICKERS = [
-    "TSLI", "YGLD", "SPYY", "GOOI", "QQQY", 
-    "COIY", "METY", "ONVD", "OAMZ", "AAPY", "YMSF"
+    'TSLI.L', 'YGLD.DE', 'SPYY.L', 'GOOI.L', 'QQQY.L', 
+    'COIY.L', 'METY.L', 'ONVD.DE', 'OAMZ.DE', 'AAPY.DE', 'YMSF.DE'
 ]
 
-# Base URL for the funds
-BASE_URL = "https://www.trackinsight.com/en/fund/"
+def format_currency(value, currency_symbol='$'):
+    """Format a number as currency."""
+    if pd.isna(value):
+        return "N/A"
+    return f"{currency_symbol}{value:,.2f}"
+
+def format_percentage(value):
+    """Format a number as percentage."""
+    if pd.isna(value):
+        return "N/A"
+    return f"{value:.2f}%" if value >= 0 else f"{value:.2f}%"
+
+def get_currency_symbol(ticker):
+    """Get currency symbol based on ticker suffix."""
+    if ticker.endswith('.L'):
+        return '£'
+    elif ticker.endswith('.DE'):
+        return '€'
+    else:
+        return '$'
 
 def get_fund_data(ticker):
-    """Fetch and parse fund data for a given ticker."""
-    url = f"{BASE_URL}{ticker}"
-    
+    """Fetch fund data for a given ticker using yfinance."""
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://www.trackinsight.com/en/',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'same-origin',
-            'Sec-Fetch-User': '?1',
-            'Upgrade-Insecure-Requests': '1',
-        }
+        # Get ticker info
+        ticker_obj = yf.Ticker(ticker)
+        info = ticker_obj.info
         
-        response = requests.get(url, headers=headers, timeout=10)
+        # Get currency symbol
+        currency_symbol = get_currency_symbol(ticker)
         
-        if response.status_code != 200:
-            return {
-                'ticker': ticker,
-                'status': 'error',
-                'message': f'HTTP error: {response.status_code}'
-            }
+        # Calculate dates for 1 month ago
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=30)
         
-        # Save HTML content to debug
-        soup = BeautifulSoup(response.text, 'html.parser')
+        # Get historical data
+        hist = ticker_obj.history(start=start_date, end=end_date)
         
-        # First, try to find the fund name
-        fund_name_element = soup.find('h1')
-        fund_name = fund_name_element.text.strip() if fund_name_element else ticker
+        # Calculate 1-month performance
+        if not hist.empty:
+            first_price = hist['Close'].iloc[0]
+            last_price = hist['Close'].iloc[-1] if len(hist) > 1 else first_price
+            perf_1m = ((last_price - first_price) / first_price) * 100
+        else:
+            perf_1m = None
+            last_price = None
         
-        # Initialize data dictionary
-        data = {
+        # Calculate 1-day change
+        if not hist.empty and len(hist) > 1:
+            prev_day_price = hist['Close'].iloc[-2] if len(hist) > 1 else hist['Close'].iloc[0]
+            last_day_price = hist['Close'].iloc[-1]
+            change_1d = ((last_day_price - prev_day_price) / prev_day_price) * 100
+        else:
+            change_1d = None
+        
+        # Get additional info
+        name = info.get('shortName', info.get('longName', ticker))
+        
+        # Format market cap as AuM (Assets under Management)
+        market_cap = info.get('marketCap')
+        if market_cap:
+            if market_cap >= 1_000_000_000:
+                aum = f"{currency_symbol}{market_cap / 1_000_000_000:.2f}B"
+            elif market_cap >= 1_000_000:
+                aum = f"{currency_symbol}{market_cap / 1_000_000:.2f}M"
+            else:
+                aum = f"{currency_symbol}{market_cap / 1_000:.2f}K"
+        else:
+            aum = "N/A"
+        
+        # Get expense ratio if available (or use a common placeholder value for ETFs)
+        expense_ratio = info.get('annualReportExpenseRatio', info.get('totalExpenseRatio', None))
+        if expense_ratio is None:
+            # ETFs typically have expense ratios between 0.03% and 1.0%
+            # Use None to indicate it's not available
+            expense_ratio = None
+        else:
+            # Convert to percentage
+            expense_ratio = expense_ratio * 100
+        
+        return {
             'ticker': ticker,
-            'name': fund_name,
+            'name': name,
+            'last_price': last_price,
+            'currency_symbol': currency_symbol,
+            'performance_1m': perf_1m,
+            'nav_change_1d': change_1d,
+            'nav': last_price,  # Using last price as NAV
+            'aum': aum,
+            'expense_ratio': expense_ratio,
             'status': 'success'
         }
-        
-        # Find all potential data containers
-        # Look for divs that contain labels like "Last price", "1M perf", etc.
-        
-        # Method 1: Find by text content
-        last_price = None
-        performance_1m = None
-        flows_1m = None
-        aum = None
-        expense_ratio = None
-        nav = None
-        nav_change_1d = None
-        
-        # Extract data by finding relevant text labels
-        for div in soup.find_all('div'):
-            text_content = div.get_text(strip=True)
-            
-            # Last price
-            if text_content == "Last price":
-                next_div = div.find_next('div')
-                if next_div:
-                    last_price = next_div.get_text(strip=True)
-                    data['last_price'] = last_price
-            
-            # 1M performance
-            elif text_content == "1M perf." or text_content == "1M perf":
-                next_div = div.find_next('div')
-                if next_div:
-                    performance_1m = next_div.get_text(strip=True)
-                    data['performance_1m'] = performance_1m
-            
-            # 1M flows
-            elif text_content == "1M flows":
-                next_div = div.find_next('div')
-                if next_div:
-                    flows_1m = next_div.get_text(strip=True)
-                    data['flows_1m'] = flows_1m
-            
-            # AuM
-            elif text_content == "AuM":
-                next_div = div.find_next('div')
-                if next_div:
-                    aum = next_div.get_text(strip=True)
-                    data['aum'] = aum
-            
-            # Expense Ratio
-            elif text_content == "E/R":
-                next_div = div.find_next('div')
-                if next_div:
-                    expense_ratio = next_div.get_text(strip=True)
-                    data['expense_ratio'] = expense_ratio
-            
-            # NAV
-            elif text_content == "NAV":
-                next_div = div.find_next('div')
-                if next_div:
-                    nav = next_div.get_text(strip=True)
-                    data['nav'] = nav
-            
-            # NAV change
-            elif "NAV change" in text_content:
-                next_div = div.find_next('div')
-                if next_div:
-                    nav_change_1d = next_div.get_text(strip=True)
-                    data['nav_change_1d'] = nav_change_1d
-        
-        # Method 2: Try to find the data by pattern matching
-        if not last_price:
-            # Look for currency symbols followed by numbers
-            currency_pattern = re.compile(r'[\$€£¥]\s*[\d,]+\.?\d*')
-            for div in soup.find_all('div'):
-                text = div.get_text(strip=True)
-                if currency_pattern.match(text):
-                    data['last_price'] = text
-                    break
-        
-        # Alternative method: Try looking for specific CSS classes
-        # This is a fallback in case the site structure has completely changed
-        for div in soup.find_all('div', class_=lambda c: c and ('Price' in c or 'price' in c)):
-            parent_div = div.parent
-            if parent_div:
-                value_div = parent_div.find_next('div')
-                if value_div:
-                    data['last_price'] = value_div.get_text(strip=True)
-        
-        # If we couldn't find any data, mark as error
-        if len(data) <= 3:  # Only ticker, name, and status
-            return {
-                'ticker': ticker,
-                'status': 'error',
-                'message': 'Could not find fund data on page'
-            }
-        
-        return data
     
     except Exception as e:
         return {
@@ -234,80 +194,76 @@ def display_fund_cards(fund_data_list):
         
         with cols[col_idx]:
             if fund_data['status'] == 'success':
+                # Format values
+                currency_symbol = fund_data.get('currency_symbol', '$')
+                last_price = format_currency(fund_data.get('last_price'), currency_symbol) if fund_data.get('last_price') is not None else "N/A"
+                perf_1m = format_percentage(fund_data.get('performance_1m')) if fund_data.get('performance_1m') is not None else "N/A"
+                nav_change_1d = format_percentage(fund_data.get('nav_change_1d')) if fund_data.get('nav_change_1d') is not None else "N/A"
+                nav = format_currency(fund_data.get('nav'), currency_symbol) if fund_data.get('nav') is not None else "N/A"
+                aum = fund_data.get('aum', "N/A")
+                expense_ratio = format_percentage(fund_data.get('expense_ratio')) if fund_data.get('expense_ratio') is not None else "N/A"
+                
                 # Format the card HTML
                 html = f"""
                 <div class="fund-card">
                     <div class="fund-header">
-                        <div class="fund-title">{fund_data['ticker']} - {fund_data.get('name', '')}</div>
+                        <div>
+                            <div class="fund-title">{fund_data['ticker']}</div>
+                            <div class="fund-subtitle">{fund_data.get('name', '')}</div>
+                        </div>
                     </div>
                     <div class="fund-data">
                 """
                 
                 # Last price
-                if 'last_price' in fund_data:
-                    html += f"""
-                        <div class="data-item">
-                            <div class="data-label">Last Price</div>
-                            <div class="data-value">{fund_data['last_price']}</div>
-                        </div>
-                    """
+                html += f"""
+                    <div class="data-item">
+                        <div class="data-label">Last Price</div>
+                        <div class="data-value">{last_price}</div>
+                    </div>
+                """
                 
                 # 1M Performance
-                if 'performance_1m' in fund_data:
-                    value_class = "positive-value" if "+" in fund_data['performance_1m'] else "negative-value" if "-" in fund_data['performance_1m'] else ""
-                    html += f"""
-                        <div class="data-item">
-                            <div class="data-label">1M Performance</div>
-                            <div class="data-value {value_class}">{fund_data['performance_1m']}</div>
-                        </div>
-                    """
-                
-                # 1M Flows
-                if 'flows_1m' in fund_data:
-                    value_class = "positive-value" if "+" in fund_data['flows_1m'] else "negative-value" if "-" in fund_data['flows_1m'] else ""
-                    html += f"""
-                        <div class="data-item">
-                            <div class="data-label">1M Flows</div>
-                            <div class="data-value {value_class}">{fund_data['flows_1m']}</div>
-                        </div>
-                    """
+                perf_class = "positive-value" if fund_data.get('performance_1m', 0) >= 0 else "negative-value"
+                html += f"""
+                    <div class="data-item">
+                        <div class="data-label">1M Performance</div>
+                        <div class="data-value {perf_class}">{perf_1m}</div>
+                    </div>
+                """
                 
                 # AuM
-                if 'aum' in fund_data:
-                    html += f"""
-                        <div class="data-item">
-                            <div class="data-label">AuM</div>
-                            <div class="data-value">{fund_data['aum']}</div>
-                        </div>
-                    """
+                html += f"""
+                    <div class="data-item">
+                        <div class="data-label">AuM</div>
+                        <div class="data-value">{aum}</div>
+                    </div>
+                """
                 
                 # Expense Ratio
-                if 'expense_ratio' in fund_data:
-                    html += f"""
-                        <div class="data-item">
-                            <div class="data-label">Expense Ratio</div>
-                            <div class="data-value">{fund_data['expense_ratio']}</div>
-                        </div>
-                    """
+                html += f"""
+                    <div class="data-item">
+                        <div class="data-label">Expense Ratio</div>
+                        <div class="data-value">{expense_ratio}</div>
+                    </div>
+                """
                 
                 # NAV
-                if 'nav' in fund_data:
-                    html += f"""
-                        <div class="data-item">
-                            <div class="data-label">NAV</div>
-                            <div class="data-value">{fund_data['nav']}</div>
-                        </div>
-                    """
+                html += f"""
+                    <div class="data-item">
+                        <div class="data-label">NAV</div>
+                        <div class="data-value">{nav}</div>
+                    </div>
+                """
                 
                 # 1D NAV Change
-                if 'nav_change_1d' in fund_data:
-                    value_class = "positive-value" if "+" in fund_data.get('nav_change_1d', '') else "negative-value" if "-" in fund_data.get('nav_change_1d', '') else ""
-                    html += f"""
-                        <div class="data-item">
-                            <div class="data-label">1D NAV Change</div>
-                            <div class="data-value {value_class}">{fund_data['nav_change_1d']}</div>
-                        </div>
-                    """
+                change_class = "positive-value" if fund_data.get('nav_change_1d', 0) >= 0 else "negative-value"
+                html += f"""
+                    <div class="data-item">
+                        <div class="data-label">1D NAV Change</div>
+                        <div class="data-value {change_class}">{nav_change_1d}</div>
+                    </div>
+                """
                 
                 # Close the card
                 html += f"""
@@ -317,6 +273,37 @@ def display_fund_cards(fund_data_list):
                 """
                 
                 st.markdown(html, unsafe_allow_html=True)
+                
+                # Add price chart
+                with st.expander(f"View {fund_data['ticker']} Chart"):
+                    try:
+                        # Get historical data for the past 6 months
+                        ticker_obj = yf.Ticker(fund_data['ticker'])
+                        end_date = datetime.now()
+                        start_date = end_date - timedelta(days=180)
+                        hist = ticker_obj.history(start=start_date, end=end_date)
+                        
+                        if not hist.empty:
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=hist.index,
+                                y=hist['Close'],
+                                mode='lines',
+                                name='Close Price',
+                                line=dict(color='royalblue', width=2)
+                            ))
+                            fig.update_layout(
+                                title=f"{fund_data['ticker']} - 6 Month Price History",
+                                xaxis_title="Date",
+                                yaxis_title=f"Price ({currency_symbol})",
+                                height=400,
+                                margin=dict(l=0, r=0, t=40, b=0)
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("No historical data available for chart.")
+                    except Exception as e:
+                        st.error(f"Error loading chart: {str(e)}")
             else:
                 # Display error card
                 st.error(f"Error fetching data for {fund_data['ticker']}: {fund_data.get('message', 'Unknown error')}")
@@ -333,16 +320,16 @@ def display_table_view(fund_data_list):
     # Prepare data for pandas DataFrame
     table_data = []
     for fund in valid_data:
+        currency_symbol = fund.get('currency_symbol', '$')
         row = {
             'Ticker': fund['ticker'],
             'Name': fund.get('name', ''),
-            'Last Price': fund.get('last_price', ''),
-            '1M Performance': fund.get('performance_1m', ''),
-            '1M Flows': fund.get('flows_1m', ''),
-            'AuM': fund.get('aum', ''),
-            'Expense Ratio': fund.get('expense_ratio', ''),
-            'NAV': fund.get('nav', ''),
-            '1D NAV Change': fund.get('nav_change_1d', '')
+            'Last Price': format_currency(fund.get('last_price'), currency_symbol) if fund.get('last_price') is not None else "N/A",
+            '1M Performance': format_percentage(fund.get('performance_1m')) if fund.get('performance_1m') is not None else "N/A",
+            'AuM': fund.get('aum', 'N/A'),
+            'Expense Ratio': format_percentage(fund.get('expense_ratio')) if fund.get('expense_ratio') is not None else "N/A",
+            'NAV': format_currency(fund.get('nav'), currency_symbol) if fund.get('nav') is not None else "N/A",
+            '1D NAV Change': format_percentage(fund.get('nav_change_1d')) if fund.get('nav_change_1d') is not None else "N/A"
         }
         table_data.append(row)
     
@@ -351,20 +338,49 @@ def display_table_view(fund_data_list):
     
     # Display table
     st.dataframe(df)
+    
+    # Add a chart showing comparative performance
+    st.subheader("Comparative 1-Month Performance")
+    
+    # Create dataframe for chart
+    perf_data = {
+        'Ticker': [],
+        'Performance (%)': []
+    }
+    
+    for fund in valid_data:
+        if fund.get('performance_1m') is not None:
+            perf_data['Ticker'].append(fund['ticker'])
+            perf_data['Performance (%)'].append(fund.get('performance_1m', 0))
+    
+    if perf_data['Ticker']:
+        perf_df = pd.DataFrame(perf_data)
+        fig = go.Figure()
+        colors = ['#28a745' if x >= 0 else '#dc3545' for x in perf_df['Performance (%)']]
+        
+        fig.add_trace(go.Bar(
+            x=perf_df['Ticker'],
+            y=perf_df['Performance (%)'],
+            marker_color=colors,
+            text=perf_df['Performance (%)'].apply(lambda x: f"{x:.2f}%"),
+            textposition='auto'
+        ))
+        
+        fig.update_layout(
+            title="1-Month Performance Comparison",
+            xaxis_title="Fund",
+            yaxis_title="Performance (%)",
+            height=500
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No performance data available for comparison chart.")
 
 def main():
     # App title and description
     st.title("📊 Fund Data Tracker")
-    st.markdown("Real-time data for selected funds from TrackInsight")
-    
-    # Add debugging options
-    with st.expander("Debug Options"):
-        debug_ticker = st.selectbox("Test single ticker", [""] + FUND_TICKERS)
-        if st.button("Test Fetch"):
-            if debug_ticker:
-                with st.spinner(f"Testing fetch for {debug_ticker}..."):
-                    result = get_fund_data(debug_ticker)
-                    st.json(result)
+    st.markdown("Real-time data for selected funds from Yahoo Finance")
     
     # Add a refresh button and view toggle
     col1, col2 = st.columns([1, 4])
@@ -394,7 +410,7 @@ def main():
     
     # Add footer with credits
     st.markdown("---")
-    st.caption("Data source: TrackInsight.com")
+    st.caption("Data source: Yahoo Finance")
 
 if __name__ == "__main__":
     main()
