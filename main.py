@@ -5,6 +5,13 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
+import random
+import requests
+from requests.exceptions import HTTPError, RequestException
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Set page configuration
 st.set_page_config(
@@ -77,6 +84,11 @@ FUND_TICKERS = [
     'COIY.L', 'METY.L', 'ONVD.DE', 'OAMZ.DE', 'AAPY.DE', 'YMSF.DE'
 ]
 
+# Cache for ticker data to avoid repeated API calls
+if 'ticker_cache' not in st.session_state:
+    st.session_state.ticker_cache = {}
+    st.session_state.cache_timestamp = {}
+
 def format_currency(value, currency_symbol='$'):
     """Format a number as currency."""
     if pd.isna(value):
@@ -98,89 +110,163 @@ def get_currency_symbol(ticker):
     else:
         return '$'
 
+def fetch_with_retry(ticker_obj, method_name, *args, max_retries=3, **kwargs):
+    """Fetch data with retry logic and exponential backoff."""
+    retries = 0
+    while retries < max_retries:
+        try:
+            # Add a random delay to avoid rate limiting
+            time.sleep(random.uniform(0.5, 2.0))
+            
+            # Get the method to call
+            method = getattr(ticker_obj, method_name)
+            return method(*args, **kwargs)
+        except (HTTPError, RequestException) as e:
+            if "429" in str(e):  # Too Many Requests
+                wait_time = (2 ** retries) + random.random()
+                logging.warning(f"Rate limit hit for {ticker_obj.ticker}. Waiting {wait_time:.2f}s before retry {retries+1}/{max_retries}")
+                time.sleep(wait_time)
+                retries += 1
+            else:
+                raise
+    
+    # If we've exhausted retries
+    raise Exception(f"Failed to fetch {method_name} for {ticker_obj.ticker} after {max_retries} retries")
+
 def get_fund_data(ticker):
-    """Fetch fund data for a given ticker using yfinance."""
+    """Fetch fund data for a given ticker using yfinance with caching and retries."""
+    # Check cache first
+    current_time = time.time()
+    cache_time = st.session_state.cache_timestamp.get(ticker, 0)
+    cache_age = current_time - cache_time
+    
+    # Use cache if it's less than 15 minutes old
+    if ticker in st.session_state.ticker_cache and cache_age < 900:  # 15 minutes
+        return st.session_state.ticker_cache[ticker]
+    
     try:
         # Get ticker info
         ticker_obj = yf.Ticker(ticker)
-        info = ticker_obj.info
         
-        # Get currency symbol
-        currency_symbol = get_currency_symbol(ticker)
-        
-        # Calculate dates for 1 month ago
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=30)
-        
-        # Get historical data
-        hist = ticker_obj.history(start=start_date, end=end_date)
-        
-        # Calculate 1-month performance
-        if not hist.empty:
-            first_price = hist['Close'].iloc[0]
-            last_price = hist['Close'].iloc[-1] if len(hist) > 1 else first_price
-            perf_1m = ((last_price - first_price) / first_price) * 100
-        else:
-            perf_1m = None
+        try:
+            # Try to get info with retries
+            info = {}
+            try:
+                info = fetch_with_retry(ticker_obj, 'info')
+            except Exception as e:
+                logging.warning(f"Failed to get full info for {ticker}: {str(e)}")
+                # Fall back to basics if we can't get full info
+                pass
+            
+            # Get currency symbol
+            currency_symbol = get_currency_symbol(ticker)
+            
+            # Calculate dates for historical data
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=35)  # Get a bit more than 1 month
+            
+            # Get historical data with retries
+            hist = None
+            try:
+                hist = fetch_with_retry(ticker_obj, 'history', start=start_date, end=end_date)
+            except Exception as e:
+                logging.warning(f"Failed to get history for {ticker}: {str(e)}")
+                hist = pd.DataFrame()  # Empty DataFrame as fallback
+            
+            # Calculate last price
             last_price = None
-        
-        # Calculate 1-day change
-        if not hist.empty and len(hist) > 1:
-            prev_day_price = hist['Close'].iloc[-2] if len(hist) > 1 else hist['Close'].iloc[0]
-            last_day_price = hist['Close'].iloc[-1]
-            change_1d = ((last_day_price - prev_day_price) / prev_day_price) * 100
-        else:
+            if not hist.empty:
+                last_price = hist['Close'].iloc[-1]
+            
+            # Calculate 1-month performance
+            perf_1m = None
+            if not hist.empty and len(hist) > 20:  # Need enough data points
+                # Try to get price from approximately 1 month ago
+                first_price = hist['Close'].iloc[0]
+                perf_1m = ((last_price - first_price) / first_price) * 100 if first_price else None
+            
+            # Calculate 1-day change
             change_1d = None
-        
-        # Get additional info
-        name = info.get('shortName', info.get('longName', ticker))
-        
-        # Format market cap as AuM (Assets under Management)
-        market_cap = info.get('marketCap')
-        if market_cap:
-            if market_cap >= 1_000_000_000:
-                aum = f"{currency_symbol}{market_cap / 1_000_000_000:.2f}B"
-            elif market_cap >= 1_000_000:
-                aum = f"{currency_symbol}{market_cap / 1_000_000:.2f}M"
+            if not hist.empty and len(hist) > 1:
+                prev_day_price = hist['Close'].iloc[-2]
+                change_1d = ((last_price - prev_day_price) / prev_day_price) * 100 if prev_day_price else None
+            
+            # Get name
+            name = info.get('shortName', info.get('longName', ticker.split('.')[0]))
+            
+            # Format market cap as AuM (Assets under Management)
+            market_cap = info.get('marketCap')
+            if market_cap:
+                if market_cap >= 1_000_000_000:
+                    aum = f"{currency_symbol}{market_cap / 1_000_000_000:.2f}B"
+                elif market_cap >= 1_000_000:
+                    aum = f"{currency_symbol}{market_cap / 1_000_000:.2f}M"
+                else:
+                    aum = f"{currency_symbol}{market_cap / 1_000:.2f}K"
             else:
-                aum = f"{currency_symbol}{market_cap / 1_000:.2f}K"
-        else:
-            aum = "N/A"
-        
-        # Get expense ratio if available (or use a common placeholder value for ETFs)
-        expense_ratio = info.get('annualReportExpenseRatio', info.get('totalExpenseRatio', None))
-        if expense_ratio is None:
-            # ETFs typically have expense ratios between 0.03% and 1.0%
-            # Use None to indicate it's not available
-            expense_ratio = None
-        else:
-            # Convert to percentage
-            expense_ratio = expense_ratio * 100
-        
-        return {
-            'ticker': ticker,
-            'name': name,
-            'last_price': last_price,
-            'currency_symbol': currency_symbol,
-            'performance_1m': perf_1m,
-            'nav_change_1d': change_1d,
-            'nav': last_price,  # Using last price as NAV
-            'aum': aum,
-            'expense_ratio': expense_ratio,
-            'status': 'success'
-        }
+                aum = "N/A"
+            
+            # Get expense ratio if available
+            expense_ratio = info.get('annualReportExpenseRatio', info.get('totalExpenseRatio', None))
+            if expense_ratio is None:
+                expense_ratio = None
+            else:
+                # Convert to percentage
+                expense_ratio = expense_ratio * 100
+            
+            result = {
+                'ticker': ticker,
+                'name': name,
+                'last_price': last_price,
+                'currency_symbol': currency_symbol,
+                'performance_1m': perf_1m,
+                'nav_change_1d': change_1d,
+                'nav': last_price,  # Using last price as NAV
+                'aum': aum,
+                'expense_ratio': expense_ratio,
+                'status': 'success'
+            }
+            
+            # Store in cache
+            st.session_state.ticker_cache[ticker] = result
+            st.session_state.cache_timestamp[ticker] = current_time
+            
+            return result
+            
+        except Exception as e:
+            logging.error(f"Error processing {ticker} data: {str(e)}")
+            return {
+                'ticker': ticker,
+                'status': 'error',
+                'message': f"Data processing error: {str(e)}"
+            }
     
     except Exception as e:
+        logging.error(f"Failed to initialize ticker {ticker}: {str(e)}")
         return {
             'ticker': ticker,
             'status': 'error',
             'message': str(e)
         }
 
-def fetch_all_fund_data():
-    """Fetch data for all funds in parallel."""
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        results = list(executor.map(get_fund_data, FUND_TICKERS))
+def fetch_sequentially(tickers):
+    """Fetch ticker data sequentially to avoid rate limiting."""
+    results = []
+    progress_bar = st.progress(0)
+    
+    for i, ticker in enumerate(tickers):
+        # Update progress
+        progress = (i / len(tickers))
+        progress_bar.progress(progress, f"Fetching {ticker}...")
+        
+        # Fetch data with delay between requests
+        result = get_fund_data(ticker)
+        results.append(result)
+        
+        # Small delay between requests
+        time.sleep(random.uniform(1.0, 2.0))
+    
+    progress_bar.progress(1.0)
     return results
 
 def display_fund_cards(fund_data_list):
@@ -274,14 +360,18 @@ def display_fund_cards(fund_data_list):
                 
                 st.markdown(html, unsafe_allow_html=True)
                 
-                # Add price chart
-                with st.expander(f"View {fund_data['ticker']} Chart"):
+                # Add price chart button (load chart only when clicked)
+                if st.button(f"View {fund_data['ticker']} Chart", key=f"chart_{fund_data['ticker']}"):
                     try:
                         # Get historical data for the past 6 months
                         ticker_obj = yf.Ticker(fund_data['ticker'])
                         end_date = datetime.now()
                         start_date = end_date - timedelta(days=180)
-                        hist = ticker_obj.history(start=start_date, end=end_date)
+                        
+                        with st.spinner(f"Loading chart for {fund_data['ticker']}..."):
+                            # Add delay to avoid rate limiting
+                            time.sleep(random.uniform(0.5, 1.5))
+                            hist = ticker_obj.history(start=start_date, end=end_date)
                         
                         if not hist.empty:
                             fig = go.Figure()
@@ -339,48 +429,64 @@ def display_table_view(fund_data_list):
     # Display table
     st.dataframe(df)
     
-    # Add a chart showing comparative performance
-    st.subheader("Comparative 1-Month Performance")
-    
-    # Create dataframe for chart
-    perf_data = {
-        'Ticker': [],
-        'Performance (%)': []
-    }
-    
-    for fund in valid_data:
-        if fund.get('performance_1m') is not None:
-            perf_data['Ticker'].append(fund['ticker'])
-            perf_data['Performance (%)'].append(fund.get('performance_1m', 0))
-    
-    if perf_data['Ticker']:
-        perf_df = pd.DataFrame(perf_data)
-        fig = go.Figure()
-        colors = ['#28a745' if x >= 0 else '#dc3545' for x in perf_df['Performance (%)']]
+    # Add a chart showing comparative performance (only if clicked)
+    if st.button("Show Performance Comparison Chart"):
+        # Create dataframe for chart
+        perf_data = {
+            'Ticker': [],
+            'Performance (%)': []
+        }
         
-        fig.add_trace(go.Bar(
-            x=perf_df['Ticker'],
-            y=perf_df['Performance (%)'],
-            marker_color=colors,
-            text=perf_df['Performance (%)'].apply(lambda x: f"{x:.2f}%"),
-            textposition='auto'
-        ))
+        for fund in valid_data:
+            if fund.get('performance_1m') is not None:
+                perf_data['Ticker'].append(fund['ticker'])
+                perf_data['Performance (%)'].append(fund.get('performance_1m', 0))
         
-        fig.update_layout(
-            title="1-Month Performance Comparison",
-            xaxis_title="Fund",
-            yaxis_title="Performance (%)",
-            height=500
-        )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No performance data available for comparison chart.")
+        if perf_data['Ticker']:
+            perf_df = pd.DataFrame(perf_data)
+            fig = go.Figure()
+            colors = ['#28a745' if x >= 0 else '#dc3545' for x in perf_df['Performance (%)']]
+            
+            fig.add_trace(go.Bar(
+                x=perf_df['Ticker'],
+                y=perf_df['Performance (%)'],
+                marker_color=colors,
+                text=perf_df['Performance (%)'].apply(lambda x: f"{x:.2f}%"),
+                textposition='auto'
+            ))
+            
+            fig.update_layout(
+                title="1-Month Performance Comparison",
+                xaxis_title="Fund",
+                yaxis_title="Performance (%)",
+                height=500
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No performance data available for comparison chart.")
 
 def main():
     # App title and description
     st.title("📊 Fund Data Tracker")
     st.markdown("Real-time data for selected funds from Yahoo Finance")
+    
+    # Add settings sidebar
+    with st.sidebar:
+        st.header("Settings")
+        cache_duration = st.slider(
+            "Cache Duration (minutes)", 
+            min_value=5, 
+            max_value=60, 
+            value=15,
+            help="How long to keep fund data in cache before refreshing"
+        )
+        fetch_method = st.radio(
+            "Data Fetch Method",
+            options=["Sequential (Slower but Reliable)", "Parallel (Faster but May Hit Rate Limits)"],
+            index=0,
+            help="Choose how to fetch data from Yahoo Finance"
+        )
     
     # Add a refresh button and view toggle
     col1, col2 = st.columns([1, 4])
@@ -395,7 +501,11 @@ def main():
     # Session state to store fund data
     if 'fund_data' not in st.session_state or refresh:
         with st.spinner("Fetching latest fund data..."):
-            st.session_state.fund_data = fetch_all_fund_data()
+            if fetch_method.startswith("Sequential"):
+                st.session_state.fund_data = fetch_sequentially(FUND_TICKERS)
+            else:
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    st.session_state.fund_data = list(executor.map(get_fund_data, FUND_TICKERS))
             st.session_state.last_updated = time.strftime('%Y-%m-%d %H:%M:%S')
     
     # Display last updated time
